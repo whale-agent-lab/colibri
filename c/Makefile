@@ -1,7 +1,18 @@
-UNAME_S := $(shell uname -s)
-MINGW    := $(findstring MINGW,$(UNAME_S))
-MSYS     := $(findstring MSYS,$(UNAME_S))
-IS_WIN   := $(MINGW)$(MSYS)
+# --- OS detection ---
+# On Windows the OS env var is 'Windows_NT' in EVERY shell (cmd, PowerShell,
+# MSYS2, Git-Bash), and GNU Make imports it. Detect Windows from it FIRST so
+# `make` works from a native PowerShell/CMD shell — there `uname` is not on
+# PATH, so the old uname-only check returned empty and fell through to the
+# Linux branch (no .exe, no -static). We only call `uname` when NOT on Windows.
+ifeq ($(OS),Windows_NT)
+IS_WIN   := 1
+UNAME_S  :=
+UNAME_M  :=
+else
+IS_WIN   :=
+UNAME_S  := $(shell uname -s)
+UNAME_M  := $(shell uname -m)
+endif
 
 ifeq ($(UNAME_S),Darwin)
 # --- macOS / Apple Silicon ---
@@ -24,9 +35,12 @@ EXE     =
 else ifneq ($(IS_WIN),)
 # --- Windows 11 x86-64 (MinGW-w64 / MSYS2) ---
 # GCC + libgomp + winpthreads: pthread, OpenMP, clock_gettime, opendir/readdir,
-# AVX2 intrinsics — tutto gratis, nessun porting.
-# ARCH default = x86-64-v3 (binario portabile con AVX2). Per max velocita'
-# su QUESTA macchina: make ARCH=native
+# AVX2 intrinsics - tutto gratis, nessun porting.
+# ARCH default = x86-64-v3 (portable binary with AVX2). For max speed on THIS
+# machine use ARCH=native: on AVX-VNNI CPUs (Intel Alder Lake+, Meteor Lake+)
+# it also unlocks the 128-bit VPDPBUSD int8/int4 dot kernel (dot_i8i8/dot_i4i8),
+# which the x86-64-v3 baseline does not define. The #ifdef guards in glm.c mean
+# a v3 build simply compiles out the VNNI path - safe on any x86-64.
 CC      = gcc
 ARCH   ?= x86-64-v3
 CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
@@ -59,43 +73,41 @@ endif
 
 # CUDA=1 adds an opt-in backend for resident tensors. The default build remains
 # pure C and keeps the original zero-dependency runtime.
+#
+# Two paths:
+#   - Linux/macOS: CUDA=1 links backend_cuda.o directly (cudart via -l).
+#   - Windows:      CUDA_DLL=1 builds a standalone coli_cuda.dll (nvcc+MSVC),
+#                   then the host glm.exe loads it at runtime via backend_loader.c
+#                   (LoadLibrary/GetProcAddress). MinGW gcc cannot compile .cu
+#                   (nvcc needs cl.exe), and cross-linking MSVC objects into a
+#                   gcc binary is fragile — the DLL split keeps the toolchains
+#                   clean. See backend_loader.c and README "cuda-dll" below.
 CUDA      ?= 0
+CUDA_DLL  ?= 0
 CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 CUDA_OBJ  =
-V4_TEST_BINS = tests/test_model_interfaces$(EXE) \
-	tests/test_safetensors_index$(EXE) tests/test_native_quant$(EXE) \
-	tests/test_deepseek_v4_expert_store$(EXE) \
-	tests/test_deepseek_v4_math$(EXE) tests/test_deepseek_v4_expert$(EXE) \
-	tests/test_deepseek_v4_config$(EXE) tests/test_tensor_io$(EXE) \
-	tests/test_deepseek_v4_layer$(EXE) \
-	tests/test_deepseek_v4_sparse_attention$(EXE) \
-	tests/test_deepseek_v4_kv_cache$(EXE) \
-	tests/test_deepseek_v4_attention_cache$(EXE) \
-	tests/test_deepseek_v4_resource_plan$(EXE) \
-	tests/test_deepseek_v4_prompt$(EXE)
-V4_TOOL_BINS = tools/probe_deepseek_v4_layers$(EXE) \
-	tools/probe_deepseek_v4_attention$(EXE) \
-	tools/probe_deepseek_v4_block$(EXE) \
-	tools/probe_deepseek_v4_compressor$(EXE) \
-	tools/probe_deepseek_v4_ratio4_compressor$(EXE) \
-	tools/probe_deepseek_v4_indexer$(EXE) \
-	tools/probe_deepseek_v4_attention_sequence$(EXE) \
-	tools/deepseek_v4_first_token$(EXE) \
-	tools/deepseek_v4_tokenizer$(EXE)
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) \
-	tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) \
-	tests/test_idot$(EXE) $(V4_TEST_BINS)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_acc512$(EXE)
+
+# Windows CUDA DLL path: host links the loader, NOT cudart.
+ifneq ($(IS_WIN),)
+ifeq ($(CUDA_DLL),1)
+CFLAGS  += -DCOLI_CUDA
+CUDA_OBJ = backend_loader.o
+endif
+endif
+
+# Linux CUDA direct-link path (unchanged).
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
 $(error CUDA=1 is supported only on Linux)
 endif
 ifneq ($(IS_WIN),)
-# GPU: stub only in Phase 1 (G0). G1 builds coli_cuda.dll with MSVC+nvcc.
-$(error CUDA=1 on Windows requires G1: build coli_cuda.dll with MSVC+nvcc (see PORT_WINDOWS_PLAN.md §8))
+# On Windows use CUDA_DLL=1 (runtime DLL), not CUDA=1 (direct link).
+$(error On Windows use: make CUDA_DLL=1 cuda-dll  (see backend_loader.c))
 endif
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
@@ -118,15 +130,27 @@ endif
 
 all: glm$(EXE)
 
-.PHONY: deepseek-v4
-deepseek-v4:
-	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4
-
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
 
 glm$(EXE): glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) -o glm$(EXE) $(LDFLAGS)
+
+# Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
+backend_loader.o: backend_loader.c backend_cuda.h compat.h
+	$(CC) $(CFLAGS) -c backend_loader.c -o $@
+
+# Windows CUDA DLL: compile backend_cuda.cu with nvcc (+MSVC cl.exe as host
+# compiler, required by nvcc on Windows) into coli_cuda.dll. Run this from a
+# shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
+# "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
+# __declspec(dllexport) so the 11 API symbols are exported.
+cuda-dll: backend_cuda.cu backend_cuda.h
+	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	$(NVCC) $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
+		-L"$(CUDA_HOME)/lib/x64" -lcudart \
+		backend_cuda.cu -o coli_cuda.dll
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -177,123 +201,9 @@ tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
 tests/test_idot$(EXE): tests/test_idot.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_model_interfaces$(EXE): tests/test_model_interfaces.c model.h expert_store.h tensor.h
+tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_safetensors_index$(EXE): tests/test_safetensors_index.c safetensors_index.c safetensors_index.h json.h
-	$(CC) $(CFLAGS) safetensors_index.c $< -o $@ $(LDFLAGS)
-
-tests/test_native_quant$(EXE): tests/test_native_quant.c native_quant.c native_quant.h tensor.h
-	$(CC) $(CFLAGS) native_quant.c $< -o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_expert_store$(EXE): tests/test_deepseek_v4_expert_store.c deepseek_v4_expert_store.c deepseek_v4_expert_store.h safetensors_index.c safetensors_index.h expert_store.h tensor.h json.h
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_expert_store.c $< \
-		-o $@ -pthread $(LDFLAGS)
-
-tests/test_deepseek_v4_math$(EXE): tests/test_deepseek_v4_math.c deepseek_v4_math.c deepseek_v4_math.h
-	$(CC) $(CFLAGS) deepseek_v4_math.c $< -o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_expert$(EXE): tests/test_deepseek_v4_expert.c deepseek_v4_expert.c deepseek_v4_expert.h deepseek_v4_math.c deepseek_v4_math.h native_quant.c native_quant.h expert_store.h tensor.h
-	$(CC) $(CFLAGS) native_quant.c deepseek_v4_math.c deepseek_v4_expert.c $< \
-		-o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_config$(EXE): tests/test_deepseek_v4_config.c deepseek_v4_config.c deepseek_v4_config.h json.h
-	$(CC) $(CFLAGS) deepseek_v4_config.c $< -o $@ $(LDFLAGS)
-
-tests/test_tensor_io$(EXE): tests/test_tensor_io.c tensor_io.c tensor_io.h native_quant.c native_quant.h safetensors_index.c safetensors_index.h tensor.h json.h
-	$(CC) $(CFLAGS) safetensors_index.c native_quant.c tensor_io.c $< \
-		-o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_layer$(EXE): tests/test_deepseek_v4_layer.c deepseek_v4_layer.c deepseek_v4_layer.h deepseek_v4_config.h safetensors_index.c safetensors_index.h json.h
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_layer.c $< \
-		-o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_sparse_attention$(EXE): tests/test_deepseek_v4_sparse_attention.c deepseek_v4_sparse_attention.c deepseek_v4_sparse_attention.h native_quant.c native_quant.h
-	$(CC) $(CFLAGS) deepseek_v4_sparse_attention.c native_quant.c $< -o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_kv_cache$(EXE): tests/test_deepseek_v4_kv_cache.c deepseek_v4_kv_cache.c deepseek_v4_kv_cache.h
-	$(CC) $(CFLAGS) deepseek_v4_kv_cache.c $< -o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_attention_cache$(EXE): tests/test_deepseek_v4_attention_cache.c deepseek_v4_attention_cache.c deepseek_v4_attention_cache.h deepseek_v4_kv_cache.c deepseek_v4_kv_cache.h deepseek_v4_sparse_attention.c deepseek_v4_sparse_attention.h native_quant.c native_quant.h
-	$(CC) $(CFLAGS) deepseek_v4_attention_cache.c deepseek_v4_kv_cache.c \
-		deepseek_v4_sparse_attention.c native_quant.c $< -o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_resource_plan$(EXE): tests/test_deepseek_v4_resource_plan.c deepseek_v4_resource_plan.c deepseek_v4_resource_plan.h
-	$(CC) $(CFLAGS) deepseek_v4_resource_plan.c $< -o $@ $(LDFLAGS)
-
-tests/test_deepseek_v4_prompt$(EXE): tests/test_deepseek_v4_prompt.c deepseek_v4_prompt.c deepseek_v4_prompt.h
-	$(CC) $(CFLAGS) deepseek_v4_prompt.c $< -o $@ $(LDFLAGS)
-probe-v4-layers: tools/probe_deepseek_v4_layers$(EXE)
-	./tools/probe_deepseek_v4_layers$(EXE) $(MODEL) $(LAYER)
-
-tools/probe_deepseek_v4_layers$(EXE): tools/probe_deepseek_v4_layers.c deepseek_v4_layer.c deepseek_v4_config.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c $< \
-		-o $@ $(LDFLAGS)
-
-probe-v4-attention: tools/probe_deepseek_v4_attention$(EXE)
-	./tools/probe_deepseek_v4_attention$(EXE) $(MODEL) $(TOKEN) $(OUTPUT)
-
-tools/probe_deepseek_v4_attention$(EXE): tools/probe_deepseek_v4_attention.c deepseek_v4_attention.c deepseek_v4_compressor.c deepseek_v4_indexer.c deepseek_v4_sparse_attention.c deepseek_v4_layer.c deepseek_v4_config.c deepseek_v4_math.c native_quant.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c \
-		deepseek_v4_math.c native_quant.c deepseek_v4_sparse_attention.c \
-		deepseek_v4_compressor.c deepseek_v4_indexer.c deepseek_v4_attention.c $< -o $@ $(LDFLAGS)
-
-probe-v4-block: tools/probe_deepseek_v4_block$(EXE)
-	./tools/probe_deepseek_v4_block$(EXE) $(MODEL) $(TOKEN) $(OUTPUT)
-
-tools/probe_deepseek_v4_block$(EXE): tools/probe_deepseek_v4_block.c deepseek_v4_block.c deepseek_v4_attention.c deepseek_v4_compressor.c deepseek_v4_indexer.c deepseek_v4_sparse_attention.c deepseek_v4_expert.c deepseek_v4_expert_store.c deepseek_v4_layer.c deepseek_v4_config.c deepseek_v4_math.c native_quant.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c \
-		deepseek_v4_math.c native_quant.c deepseek_v4_sparse_attention.c \
-		deepseek_v4_compressor.c deepseek_v4_indexer.c deepseek_v4_attention.c \
-		deepseek_v4_expert.c deepseek_v4_expert_store.c deepseek_v4_block.c $< \
-		-o $@ -pthread $(LDFLAGS)
-
-probe-v4-compressor: tools/probe_deepseek_v4_compressor$(EXE)
-	./tools/probe_deepseek_v4_compressor$(EXE) $(MODEL) $(OUTPUT)
-
-tools/probe_deepseek_v4_compressor$(EXE): tools/probe_deepseek_v4_compressor.c deepseek_v4_compressor.c deepseek_v4_layer.c deepseek_v4_config.c deepseek_v4_math.c native_quant.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c \
-		deepseek_v4_math.c native_quant.c deepseek_v4_compressor.c $< -o $@ $(LDFLAGS)
-
-probe-v4-ratio4-compressor: tools/probe_deepseek_v4_ratio4_compressor$(EXE)
-	./tools/probe_deepseek_v4_ratio4_compressor$(EXE) $(MODEL) $(OUTPUT)
-
-tools/probe_deepseek_v4_ratio4_compressor$(EXE): tools/probe_deepseek_v4_ratio4_compressor.c deepseek_v4_compressor.c deepseek_v4_layer.c deepseek_v4_config.c deepseek_v4_math.c native_quant.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c \
-		deepseek_v4_math.c native_quant.c deepseek_v4_compressor.c $< -o $@ $(LDFLAGS)
-
-probe-v4-indexer: tools/probe_deepseek_v4_indexer$(EXE)
-	./tools/probe_deepseek_v4_indexer$(EXE) $(MODEL) $(OUTPUT)
-
-tools/probe_deepseek_v4_indexer$(EXE): tools/probe_deepseek_v4_indexer.c deepseek_v4_indexer.c deepseek_v4_indexer.h deepseek_v4_compressor.c deepseek_v4_layer.c deepseek_v4_config.c deepseek_v4_math.c native_quant.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c \
-		deepseek_v4_math.c native_quant.c deepseek_v4_compressor.c \
-		deepseek_v4_indexer.c $< -o $@ $(LDFLAGS)
-
-probe-v4-attention-sequence: tools/probe_deepseek_v4_attention_sequence$(EXE)
-	./tools/probe_deepseek_v4_attention_sequence$(EXE) $(MODEL) $(OUTPUT)
-
-tools/probe_deepseek_v4_attention_sequence$(EXE): tools/probe_deepseek_v4_attention_sequence.c deepseek_v4_attention.c deepseek_v4_compressor.c deepseek_v4_indexer.c deepseek_v4_sparse_attention.c deepseek_v4_layer.c deepseek_v4_config.c deepseek_v4_math.c native_quant.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c \
-		deepseek_v4_math.c native_quant.c deepseek_v4_sparse_attention.c \
-		deepseek_v4_compressor.c deepseek_v4_indexer.c deepseek_v4_attention.c $< -o $@ $(LDFLAGS)
-
-deepseek-v4-first-token: tools/deepseek_v4_first_token$(EXE)
-	./tools/deepseek_v4_first_token$(EXE) $(MODEL) $(TOKEN) $(COUNT)
-
-deepseek-v4-tokenizer: tools/deepseek_v4_tokenizer$(EXE)
-	./tools/deepseek_v4_tokenizer$(EXE) $(MODEL) "$(TEXT)"
-
-tools/deepseek_v4_tokenizer$(EXE): tools/deepseek_v4_tokenizer.c tok.h tok_unicode.h json.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tools/deepseek_v4_first_token$(EXE): tools/deepseek_v4_first_token.c tok.h tok_unicode.h json.h deepseek_v4_block.c deepseek_v4_attention.c deepseek_v4_sparse_attention.c deepseek_v4_compressor.c deepseek_v4_indexer.c deepseek_v4_expert.c deepseek_v4_expert_store.c deepseek_v4_layer.c deepseek_v4_config.c deepseek_v4_math.c native_quant.c tensor_io.c safetensors_index.c
-	$(CC) $(CFLAGS) safetensors_index.c deepseek_v4_config.c deepseek_v4_layer.c \
-		deepseek_v4_math.c native_quant.c tensor_io.c deepseek_v4_attention.c \
-		deepseek_v4_compressor.c deepseek_v4_indexer.c \
-		deepseek_v4_sparse_attention.c deepseek_v4_expert.c \
-		deepseek_v4_expert_store.c deepseek_v4_block.c $< \
-		-o $@ -pthread $(LDFLAGS)
 test-c: $(TEST_BINS)
 	@for test in $(TEST_BINS); do ./$$test || exit 1; done
 
@@ -309,10 +219,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_cuda_test$(EXE) backend_cuda_bench$(EXE) backend_metal.o backend_metal_test $(TEST_BINS) $(V4_TOOL_BINS)
+	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_loader.o backend_cuda_test$(EXE) backend_cuda_bench$(EXE) backend_metal.o backend_metal_test coli_cuda.dll coli_cuda.lib coli_cuda.exp $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test cuda-bench portable test-c test-python test check clean \
-	probe-v4-layers probe-v4-attention probe-v4-block probe-v4-compressor \
-	probe-v4-ratio4-compressor probe-v4-indexer probe-v4-attention-sequence \
-	deepseek-v4-first-token deepseek-v4-tokenizer
+.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean
