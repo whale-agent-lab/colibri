@@ -49,3 +49,6 @@ c/backend_metal_test
 c/tests/test_tier
 c/mio_env/
 c/bench/
+
+.venv*/
+.bench/
