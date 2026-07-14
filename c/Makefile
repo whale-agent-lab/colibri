@@ -90,7 +90,12 @@ CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_acc512$(EXE)
+V4_TEST_BINS = tests/test_model_interfaces$(EXE) \
+	tests/test_safetensors_index$(EXE) tests/test_native_quant$(EXE) \
+	tests/test_tensor_io$(EXE) tests/test_deepseek_v4$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) \
+	tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) \
+	tests/test_idot$(EXE) tests/test_i4_acc512$(EXE) $(V4_TEST_BINS)
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
 ifneq ($(IS_WIN),)
@@ -129,6 +134,10 @@ METAL_OBJ = backend_metal.o
 endif
 
 all: glm$(EXE)
+
+.PHONY: deepseek-v4
+deepseek-v4:
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
@@ -204,6 +213,38 @@ tests/test_idot$(EXE): tests/test_idot.c glm.c st.h json.h tok.h tok_unicode.h c
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_model_interfaces$(EXE): tests/test_model_interfaces.c model.h expert_store.h tensor.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_safetensors_index$(EXE): tests/test_safetensors_index.c safetensors_index.c safetensors_index.h json.h
+	$(CC) $(CFLAGS) safetensors_index.c $< -o $@ $(LDFLAGS)
+
+tests/test_native_quant$(EXE): tests/test_native_quant.c native_quant.c native_quant.h tensor.h
+	$(CC) $(CFLAGS) native_quant.c $< -o $@ $(LDFLAGS)
+
+tests/test_tensor_io$(EXE): tests/test_tensor_io.c tensor_io.c tensor_io.h native_quant.c native_quant.h safetensors_index.c safetensors_index.h tensor.h json.h
+	$(CC) $(CFLAGS) safetensors_index.c native_quant.c tensor_io.c $< \
+		-o $@ $(LDFLAGS)
+
+# Merged DeepSeek V4 unit tests — objects from amalgamated units (test-only + deps).
+include Makefile.deepseek-v4.units
+V4_TEST_LINK_OBJS = \
+	COLI_V4_UNIT_MATH.o \
+	COLI_V4_UNIT_SPARSE_ATTENTION.o \
+	COLI_V4_UNIT_RESOURCE_PLAN.o \
+	COLI_V4_UNIT_PROMPT.o \
+	$(addsuffix .o,$(V4_TEST_UNITS)) \
+	safetensors_index.o native_quant.o
+
+tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4.h \
+		deepseek_v4_dspark.h Makefile.deepseek-v4.units
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
+		COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
+		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o \
+		safetensors_index.o
+	$(CC) $(CFLAGS) native_quant.c -c -o native_quant.o
+	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
+
 test-c: $(TEST_BINS)
 	@for test in $(TEST_BINS); do ./$$test || exit 1; done
 
@@ -220,6 +261,7 @@ check:
 
 clean:
 	rm -f olmoe$(EXE) glm$(EXE) iobench$(EXE) backend_cuda.o backend_loader.o backend_cuda_test$(EXE) backend_cuda_bench$(EXE) backend_metal.o backend_metal_test coli_cuda.dll coli_cuda.lib coli_cuda.exp $(TEST_BINS)
+	-$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
 	rm -rf tests/__pycache__
 
-.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean
+.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean deepseek-v4
