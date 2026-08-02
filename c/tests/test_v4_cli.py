@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent.parent
@@ -50,11 +51,52 @@ class V4CliTest(unittest.TestCase):
             directory.cleanup()
 
     def test_v4_engine_environment_forwards_ram_and_context(self):
-        args = argparse.Namespace(ngen=8, temp=0.0, ram=64, ctx=4096)
+        args = argparse.Namespace(
+            ngen=8,
+            temp=0.0,
+            ram=64,
+            ctx=4096,
+            no_dspark=True,
+            draft_model="relative-dspark",
+        )
         env = self.cli.env_for_engine(args, "deepseek_v4")
         self.assertEqual(env["NGEN"], "8")
         self.assertEqual(env["RAM_GB"], "64")
         self.assertEqual(env["CTX"], "4096")
+        self.assertEqual(env["COLI_V4_NO_DSPARK"], "1")
+        self.assertEqual(
+            env["COLI_V4_DSPARK_MODEL"], os.path.abspath("relative-dspark")
+        )
+
+    def test_v4_run_forwards_dspark_flags(self):
+        directory, root = self.make_model()
+        try:
+            engine = root / ("deepseek_v4.exe" if os.name == "nt" else "deepseek_v4")
+            engine.write_bytes(b"")
+            draft = root / "dspark"
+            draft.mkdir()
+            args = argparse.Namespace(
+                model=str(root),
+                prompt=["hello", "world"],
+                ngen=10,
+                ram=64,
+                ctx=0,
+                temp=None,
+                no_dspark=True,
+                draft_model=str(draft),
+            )
+            with mock.patch.object(self.cli, "engine_for", return_value=str(engine)), \
+                    mock.patch.object(self.cli, "banner"), \
+                    mock.patch.object(self.cli.subprocess, "call", return_value=0) as call:
+                with self.assertRaises(SystemExit) as exited:
+                    self.cli.cmd_run(args)
+            self.assertEqual(exited.exception.code, 0)
+            command = call.call_args.args[0]
+            self.assertEqual(command[1:5], [str(root), "hello world", "--max-tokens", "10"])
+            self.assertIn("--no-dspark", command)
+            self.assertEqual(command[-2:], ["--draft-model", str(draft.resolve())])
+        finally:
+            directory.cleanup()
 
     def test_openai_renderer_uses_native_v4_multiturn_template(self):
         import openai_server

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free token-exact checks for the generated tiny V4 target fixture."""
+"""Dependency-free token-exact checks for the generated tiny V4 fixture."""
 
 from __future__ import annotations
 
@@ -45,6 +45,7 @@ def flat_oracle(case: dict[str, object]) -> dict[str, object]:
 def check_target(
     binary: Path,
     model: Path,
+    draft: Path,
     name: str,
     case: dict[str, object],
     temporary: Path,
@@ -64,17 +65,21 @@ def check_target(
             str(len(full)),
             "--greedy",
             str(len(generated)),
+            "--draft-model",
+            draft.as_posix(),
         ],
     )
-    if f"{len(full)}/{len(full)} positions" not in result.stdout:
+    expected_tf = f"{len(full)}/{len(full)} positions"
+    expected_greedy = f"{len(generated)}/{len(generated)} tokens"
+    if expected_tf not in result.stdout:
         raise AssertionError(f"target {name}: missing exact teacher-forcing result")
-    if f"{len(generated)}/{len(generated)} tokens" not in result.stdout:
+    if expected_greedy not in result.stdout:
         raise AssertionError(f"target {name}: missing exact greedy result")
     print(f"PASS target {name}: teacher forcing and greedy token-exact")
 
 
 def check_prefix_is_rejected(
-    binary: Path, model: Path, case: dict[str, object], temporary: Path
+    binary: Path, model: Path, draft: Path, case: dict[str, object], temporary: Path
 ) -> None:
     truncated = flat_oracle(case)
     truncated["full_ids"] = truncated["full_ids"][:-1]
@@ -91,6 +96,8 @@ def check_prefix_is_rejected(
             str(len(truncated["full_ids"])),
             "--greedy",
             str(len(case["greedy_new_ids"])),
+            "--draft-model",
+            draft.as_posix(),
         ],
         text=True,
         encoding="utf-8",
@@ -111,13 +118,14 @@ def token_prompt(ids: list[int]) -> str:
 def check_session(
     binary: Path,
     model: Path,
+    draft: Path,
     name: str,
     case: dict[str, object],
     temporary: Path,
+    dspark: bool,
     ordinal: int = 0,
-    compatibility_flag: bool = False,
 ) -> list[int]:
-    record = temporary / f"{name}-target-{ordinal}.json"
+    record = temporary / f"{name}-{'dspark' if dspark else 'target'}-{ordinal}.json"
     command = [
         binary.as_posix(),
         model.as_posix(),
@@ -127,10 +135,12 @@ def check_session(
         str(case["max_new_tokens"]),
         "--record-oracle",
         record.as_posix(),
+        "--draft-model",
+        draft.as_posix(),
     ]
-    if compatibility_flag:
+    if not dspark:
         command.append("--no-dspark")
-    result = run(f"target session {name}", command)
+    result = run(f"session {name} dspark={dspark}", command)
     actual = json.loads(record.read_text(encoding="utf-8"))
     expected_prompt = case["prompt_ids"]
     expected_full = case["greedy_full_ids"]
@@ -141,33 +151,53 @@ def check_session(
         )
     if actual.get("full_ids") != expected_full:
         raise AssertionError(
-            f"session {name}: exact output mismatch: "
+            f"session {name} dspark={dspark}: exact output mismatch: "
             f"expected {expected_full}, got {actual.get('full_ids')}"
         )
     stats = re.search(
-        r"v4_tokens prompt=(\d+) generated=(\d+).*?target_only=1",
+        r"v4_tokens prompt=(\d+) generated=(\d+).*?"
+        r"speculative_rounds=(\d+) proposed=(\d+) accepted=(\d+).*?enabled=(\d+)",
         result.stderr,
     )
     if not stats:
-        raise AssertionError(f"session {name}: missing target-only statistics")
-    prompt_count, generated_count = (int(value) for value in stats.groups())
+        raise AssertionError(f"session {name}: missing generation statistics")
+    prompt_count, generated_count, rounds, proposed, _accepted, enabled = (
+        int(value) for value in stats.groups()
+    )
     if prompt_count != len(expected_prompt) or generated_count != case["max_new_tokens"]:
         raise AssertionError(
-            f"session {name}: length mismatch: "
-            f"prompt={prompt_count} generated={generated_count}"
+            f"session {name}: length mismatch: prompt={prompt_count} generated={generated_count}"
         )
-    if compatibility_flag and "compatibility no-op" not in result.stderr:
-        raise AssertionError("--no-dspark compatibility notice was not emitted")
-    print(f"PASS target session {name}: exact IDs and exact length")
+    if dspark and (enabled != 1 or rounds < 1 or proposed < 1):
+        raise AssertionError(
+            f"session {name}: DSpark was not exercised: "
+            f"enabled={enabled} rounds={rounds} proposed={proposed}"
+        )
+    if not dspark and (enabled != 0 or rounds or proposed):
+        raise AssertionError(
+            f"session {name}: drafting was not disabled: "
+            f"enabled={enabled} rounds={rounds} proposed={proposed}"
+        )
+    mode = "DSpark" if dspark else "target session"
+    print(f"PASS {mode} {name}: exact IDs and exact length")
     return actual["full_ids"]
 
 
-def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
+def check_serve(
+    binary: Path,
+    model: Path,
+    draft: Path,
+    case: dict[str, object],
+    dspark: bool,
+) -> None:
+    env = dict(os.environ, CTX="128")
+    env["COLI_V4_NO_DSPARK"] = "0" if dspark else "1"
+    env["COLI_V4_DSPARK_MODEL"] = draft.as_posix()
     engine = openai_server.Engine(
         binary,
         model,
         max_tokens=int(case["max_new_tokens"]),
-        env=dict(os.environ, CTX="128"),
+        env=env,
         kv_slots=1,
     )
     try:
@@ -184,13 +214,19 @@ def check_serve(binary: Path, model: Path, case: dict[str, object]) -> None:
             actual = "".join(pieces)
             if actual != expected:
                 raise AssertionError(
-                    f"serve round {ordinal}: expected {expected!r}, got {actual!r}"
+                    f"serve dspark={dspark} round {ordinal}: "
+                    f"expected {expected!r}, got {actual!r}"
                 )
             if stats["prompt_tokens"] != len(case["prompt_ids"]):
-                raise AssertionError(f"serve round {ordinal}: bad prompt stats {stats}")
+                raise AssertionError(
+                    f"serve dspark={dspark} round {ordinal}: bad prompt stats {stats}"
+                )
     finally:
         engine.close()
-    print("PASS target serve: persistent SUBMIT/DATA/DONE protocol is token-exact")
+    print(
+        f"PASS {'DSpark' if dspark else 'target'} serve: "
+        "persistent SUBMIT/DATA/DONE protocol is token-exact"
+    )
 
 
 def main() -> int:
@@ -201,6 +237,7 @@ def main() -> int:
 
     binary = args.binary.resolve()
     fixture = args.fixture.resolve()
+    draft = fixture / "dspark"
     reference = json.loads((fixture / "ref.json").read_text(encoding="utf-8"))
     if reference.get("source") != "transformers":
         raise AssertionError("tiny oracle must come from independent Transformers")
@@ -208,26 +245,51 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="colibri-v4-tiny-") as directory:
         temporary = Path(directory)
-        check_target(binary, fixture, "short", cases["short"], temporary)
-        check_prefix_is_rejected(binary, fixture, cases["short"], temporary)
-        check_target(binary, fixture, "compressed", cases["compressed"], temporary)
-        check_target(binary, fixture, "long", cases["long"], temporary)
+        check_target(binary, fixture, draft, "short", cases["short"], temporary)
+        check_prefix_is_rejected(binary, fixture, draft, cases["short"], temporary)
+        check_target(binary, fixture, draft, "compressed", cases["compressed"], temporary)
+        check_target(binary, fixture, draft, "long", cases["long"], temporary)
 
+        # Repeated process-level engine/session lifecycles also validate that
+        # drafting is genuinely disabled on the ordinary runtime path.
         for ordinal in range(3):
             check_session(
                 binary,
                 fixture,
+                draft,
                 "short",
                 cases["short"],
                 temporary,
+                dspark=False,
                 ordinal=ordinal,
-                compatibility_flag=ordinal == 0,
             )
-        # The 72-token case crosses the 64-token target prefill chunk boundary.
-        check_session(binary, fixture, "long", cases["long"], temporary)
-        check_serve(binary, fixture, cases["short"])
+        # The 72-token case crosses the target and DSpark 64-token prefill
+        # chunk boundary and verifies absolute-position continuity.
+        target_long = check_session(
+            binary,
+            fixture,
+            draft,
+            "long",
+            cases["long"],
+            temporary,
+            dspark=False,
+        )
+        dspark_long = check_session(
+            binary,
+            fixture,
+            draft,
+            "long",
+            cases["long"],
+            temporary,
+            dspark=True,
+        )
+        if dspark_long != target_long:
+            raise AssertionError("DSpark output differs from target-only output")
+        print("PASS DSpark enabled/disabled identity: exact full sequence")
+        check_serve(binary, fixture, draft, cases["short"], dspark=False)
+        check_serve(binary, fixture, draft, cases["short"], dspark=True)
 
-    print("PASS tiny DeepSeek V4 target oracle: all checks completed")
+    print("PASS tiny DeepSeek V4 oracle: all checks completed")
     return 0
 
 

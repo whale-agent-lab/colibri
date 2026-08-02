@@ -120,7 +120,6 @@ int coli_v4_swiglu(float *output, const float *gate, const float *up,
 #include <stdint.h>
 
 /* amalgamated: deepseek_v4_config.h */
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -561,12 +560,17 @@ typedef struct {
     uint64_t available_bytes;
     uint64_t fixed_bytes;
     uint64_t dense_bytes;
+    uint64_t dspark_streamed_bytes;
+    uint64_t dspark_full_bytes;
     uint64_t minimum_expert_bytes;
+    int has_dspark;
 } ColiDeepSeekV4ResidentTierInputs;
 
 typedef struct {
     uint64_t dense_bytes;
+    uint64_t dspark_bytes;
     int dense_resident;
+    int dspark_resident;
 } ColiDeepSeekV4ResidentTierPlan;
 
 uint64_t coli_v4_os_available_memory(void);
@@ -598,13 +602,41 @@ const void *coli_v4_head_cache_data(const ColiV4Engine *engine,
 /* Runtime options live on ColiV4Engine. */
 typedef struct {
     const char *target_model_dir;
+    const char *dspark_model_dir;
     uint64_t memory_limit_bytes;
     int context_tokens;
     int dense_resident;
+    int dspark_resident;
     uint64_t target_expert_cache_bytes;
+    uint64_t dspark_expert_cache_bytes;
+    int verify_drafts;
     int pin_slots_per_layer;
     uint64_t repin_interval;
 } ColiDeepSeekV4RuntimeOptions;
+
+/* Shared with deepseek_v4_dspark.h (guarded there to avoid double typedef). */
+#ifndef COLI_V4_DSPARK_MAX_STAGES
+#define COLI_V4_DSPARK_MAX_STAGES 8
+#endif
+#ifndef COLI_V4_DSPARK_MAX_TARGETS
+#define COLI_V4_DSPARK_MAX_TARGETS 8
+#endif
+
+#ifndef COLIBRI_DEEPSEEK_V4_DSPARK_MANIFEST_DEFINED
+#define COLIBRI_DEEPSEEK_V4_DSPARK_MANIFEST_DEFINED
+typedef struct {
+    int stage_count;
+    int block_size;
+    int noise_token_id;
+    int markov_rank;
+    int target_count;
+    int target_layer_ids[COLI_V4_DSPARK_MAX_TARGETS];
+    uint64_t common_stage_bytes[COLI_V4_DSPARK_MAX_STAGES];
+    uint64_t special_bytes;
+} ColiDeepSeekV4DSparkManifest;
+#endif
+
+typedef struct ColiV4DSparkHeads ColiV4DSparkHeads;
 
 enum { COLI_V4_RESIDENT_MAX_LAYERS = 128 };
 
@@ -621,20 +653,48 @@ struct ColiV4Engine {
         int shard;
     } head_cache;
     struct {
+        ColiV4DSparkHeads *heads;
+        ColiDeepSeekV4DSparkManifest manifest;
+        float *states[COLI_V4_DSPARK_MAX_TARGETS];
+        size_t capacity;
+        float *staged_main_x;
+        int staged_batch;
+        int staged_hidden;
+    } dspark_capture;
+    struct {
+        int available;
+        int limit;
+        int head_slot;
+        int tokens[64];
+        float logits[64];
+    } dspark_verify;
+    struct {
         ColiDeepSeekV4LayerWeights layers[COLI_V4_RESIDENT_MAX_LAYERS];
         unsigned char ready[COLI_V4_RESIDENT_MAX_LAYERS];
         const ColiSafetensorsIndex *index;
         uint64_t total_bytes;
     } dense_resident;
+    struct {
+        ColiDeepSeekV4LayerWeights layers[COLI_V4_DSPARK_MAX_STAGES];
+        unsigned char ready[COLI_V4_DSPARK_MAX_STAGES];
+        const ColiSafetensorsIndex *index;
+        uint64_t total_bytes;
+    } dspark_resident;
     char *owned_target_model_dir;
+    char *owned_dspark_model_dir;
     int owns_experts;
     int owns_index;
     int active_sessions; /* sessions created against this engine */
 };
 
+typedef struct ColiV4DSparkRunner ColiV4DSparkRunner;
+
 /* Session ownership helpers shared by production session code and tests. */
 void coli_v4_engine_attach_session(ColiV4Engine *engine);
 void coli_v4_engine_detach_session(ColiV4Engine *engine);
+void coli_v4_session_take_runner(ColiV4Session *session,
+                                 ColiV4DSparkRunner *runner);
+void coli_v4_session_clear_runner(ColiV4Session *session);
 
 #include "tok.h"
 
@@ -645,12 +705,14 @@ struct ColiV4Session {
     float *state;
     float *next;
     float *hidden;
+    float *main_x_batch;
     int *prompt_ids;
     int *generated;
     int max_prompt_tokens;
     int max_new_tokens_cap;
     int prompt_count;
     int generated_count;
+    ColiV4DSparkRunner *runner;
     Tok tokenizer;
     int tokenizer_ready;
     char *text;
@@ -685,6 +747,7 @@ extern int coli_v4_test_closed_owned_index;
 
 ColiV4Session *coli_v4_test_session_bare_create(ColiV4Engine *engine);
 void coli_v4_test_session_bare_destroy(ColiV4Session *session);
+ColiV4DSparkRunner *coli_v4_session_peek_runner(const ColiV4Session *session);
 #endif /* COLI_V4_TEST_HOOKS */
 
 #endif /* COLIBRI_DEEPSEEK_V4_INTERNAL_H */

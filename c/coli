@@ -203,6 +203,10 @@ def env_for_engine(a, arch):
     if arch == "deepseek_v4":
         if a.ram: env["RAM_GB"] = str(a.ram)
         if a.ctx: env["CTX"] = str(a.ctx)
+        if getattr(a, "no_dspark", False):
+            env["COLI_V4_NO_DSPARK"] = "1"
+        if getattr(a, "draft_model", None):
+            env["COLI_V4_DSPARK_MODEL"] = os.path.abspath(a.draft_model)
     return env
 
 def cuda_binary():
@@ -683,6 +687,8 @@ def cmd_run(a):
     if arch=="deepseek_v4":
         cmd=[engine,os.path.abspath(a.model),prompt,"--max-tokens",str(a.ngen)]
         if a.ram: cmd += ["--memory-gb",str(a.ram)]
+        if a.no_dspark: cmd.append("--no-dspark")
+        if a.draft_model: cmd += ["--draft-model",os.path.abspath(a.draft_model)]
         if os.environ.get("COLI_THINK","0")=="1": cmd.append("--thinking")
         sys.exit(subprocess.call(cmd,env=env_for_engine(a,arch)))
     # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
@@ -1165,6 +1171,10 @@ def main():
     common.add_argument("--no-tune-profile",action="store_true",
                         help="ignore a saved measured tuning profile")
     common.add_argument("--ctx",type=int,default=0)
+    common.add_argument("--no-dspark",action="store_true",
+                        help="disable the DeepSeek V4 DSpark draft model")
+    common.add_argument("--draft-model",default=os.environ.get("COLI_V4_DSPARK_MODEL"),
+                        help="DeepSeek V4 DSpark model directory")
     common.add_argument("--gpu",default=None,help="auto, none, or a device list such as 0,1")
     common.add_argument("--vram",type=float,default=0,help="total VRAM budget in GB (0=auto)")
     common.add_argument("--policy",choices=("quality","balanced","experimental-fast"),
