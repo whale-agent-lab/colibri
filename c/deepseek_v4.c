@@ -6083,6 +6083,9 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
 #define spec_print spec_print_diagnostic_legacy
 /* Target-only generation helpers. */
 #include <time.h>
+#ifndef _WIN32
+#include <sys/resource.h>   /* getrusage: not pulled in transitively on aarch64 glibc */
+#endif
 
 #define main coli_v4_first_token_legacy_main
 /* ---- begin include tools/deepseek_v4_first_token.c ---- */
